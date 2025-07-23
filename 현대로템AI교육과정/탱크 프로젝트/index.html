@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Tank Challenge minimap</title>
+  <style>
+    body {
+      margin: 0;
+      background: #f0f0f0;
+      font-family: sans-serif;
+    }
+    canvas {
+      background: white;
+      display: block;
+      margin: 20px auto;
+      border: 1px solid #ccc;
+    }
+    #mission {
+      background-color: #c4c4c4;
+      background-position: center;
+    }
+
+    .mission-panel {
+      padding: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+    }
+
+    .mission-button {
+      background: transparent;
+      border: 2px solid #000000;
+      color: #39ff14;
+      padding: 10px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .mission-button:hover,
+    .mission-button.active {
+      background: #464851;
+      color: #111;
+    }
+    
+    #map {
+      width: 300px;
+      height: 300px;
+      background-color: #eee;
+      position: relative;
+      border: 1px solid #333;
+    }
+    #tank {
+      width: 12px;
+      height: 12px;
+      background-color: blue;
+      position: absolute;
+      border-radius: 50%;
+      transform-origin: center;
+    }
+    #impact {
+      width: 24px;
+      height: 24px;
+      background-color: black;
+      position: absolute;
+      border-radius: 50%;
+      display: none;  /* 기본은 숨김 */
+    }
+    #realimpact {
+      width: 24px;
+      height: 24px;
+      background-color: red;
+      position: absolute;
+      border-radius: 50%;
+      display: none;  /* 기본은 숨김 */
+    }
+  </style>
+</head>
+<body>
+  <!-- Socket.IO 라이브러리: 서버와 실시간 데이터(장애물, 포탄 위치 등)를 주고받기 위해 사용 -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <h2 style="text-align: center;">Tank Mini Map</h2>
+
+  <div class="mission">
+    <h2>작전하달</h2>
+    <p>정찰을 돌다가 적 발견 시 엄폐 후 적을 섬멸하라!</p>
+  </div>
+
+  <div class="mission-panel">
+    <button class="mission-button">회피</button>
+    <button class="mission-button">발사</button>
+    <button class="mission-button">정찰</button>
+    <button class="mission-button">대기</button>
+  </div> 
+
+  <canvas id="map" width="300" height="300"></canvas>
+
+  <div id="map">
+    <div id="tank"></div>
+    <div id="impact"></div>
+    <div id="realimpact"></div>
+  </div>
+
+  <script>
+    // 지령 버튼 토글
+    document.querySelectorAll(".mission-button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        btn.classList.toggle("active");
+        console.log("지령:", btn.textContent, btn.classList.contains("active") ? "선택됨" : "해제됨");
+      });
+    });
+
+    // Socket.IO로 서버와 연결 (서버 주소 명시)
+    const socket = io();  
+    // 서버 연결 성공 시 로그 출력
+    socket.on('connect', () => {
+      console.log('Connected to server');
+    });
+    // 서버 연결 실패 시 오류 메시지 출력
+    socket.on('connect_error', (error) => {
+      console.error('SocketIO connection error:', error);
+    });
+
+    // map1에 장애물, LiDAR, 탱크 위치를 캔버스로 그림
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+
+    function worldToCanvas(x, z, center) {
+      const scale = canvas.width / 100;
+      const relX = x - (center.x - 50);
+      const relZ = z - (center.z - 50);
+      return {
+        x: relX * scale,
+        y: canvas.height - relZ * scale
+      };
+    }
+
+    function drawFan(playerpos, playerLidarAngleZ) {
+      const degToRad = Math.PI / 180;
+      const canvasCenter = worldToCanvas(playerpos.x, playerpos.z, playerpos);
+      const radius = 150;
+      const centerAngleDeg = playerLidarAngleZ.z;
+      const spreadDeg = 24.5;
+
+      const startAngle = (centerAngleDeg - spreadDeg) * degToRad;
+      const endAngle = (centerAngleDeg + spreadDeg) * degToRad;
+      const adjust = -Math.PI / 2;
+
+      ctx.beginPath();
+      ctx.moveTo(canvasCenter.x, canvasCenter.y);
+      ctx.arc(
+        canvasCenter.x,
+        canvasCenter.y,
+        radius,
+        startAngle + adjust,
+        endAngle + adjust,
+        false
+      );
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
+      ctx.fill();
+    }
+
+    function isPointInFan(point, playerpos, angleDeg, spreadDeg) {
+      const dx = point.x - playerpos.x;
+      const dz = point.z - playerpos.z;
+      const distance = Math.sqrt(dx * dx + dz * dz);
+      if (distance === 0) return true;
+
+      const degToRad = Math.PI / 180;
+      const centerRad = angleDeg * degToRad - Math.PI / 2;  // ⚠️ 보정 추가
+      const pointRad = Math.atan2(-dz, dx);
+
+      let diff = pointRad - centerRad;
+      while (diff > Math.PI) diff -= 2 * Math.PI;
+      while (diff < -Math.PI) diff += 2 * Math.PI;
+
+      return Math.abs(diff) <= spreadDeg * degToRad;
+    }
+
+    function drawMap(obstacles, lidar, playerpos, playerLidarAngleZ) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // 장애물
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 1;
+      ctx.font = '10px sans-serif';
+      obstacles.forEach(obs => {
+        const topLeft = worldToCanvas(obs.x_min, obs.z_max, playerpos);
+        const bottomRight = worldToCanvas(obs.x_max, obs.z_min, playerpos);
+        const w = bottomRight.x - topLeft.x;
+        const h = bottomRight.y - topLeft.y;
+        ctx.strokeRect(topLeft.x, topLeft.y, w, h);
+        ctx.fillStyle = 'red';
+        ctx.fillText(obs.id || '', topLeft.x + 2, topLeft.y - 2);
+      });
+
+      // LiDAR 포인트 (부채꼴 안은 blue, 바깥은 흐리게)
+      ctx.font = '9px sans-serif';
+      lidar.forEach(p => {
+        const inFan = isPointInFan(p, playerpos, playerLidarAngleZ.z, 24.5);
+        const canvasPt = worldToCanvas(p.x, p.z, playerpos);
+        ctx.beginPath();
+        ctx.arc(canvasPt.x, canvasPt.y, 2, 0, 2 * Math.PI);
+        ctx.fillStyle = inFan ? 'blue' : 'rgba(100,100,100,0.1)';
+        ctx.fill();
+      });
+
+      // 플레이어 위치
+      const meCanvas = worldToCanvas(playerpos.x, playerpos.z, playerpos);
+      ctx.fillStyle = 'green';
+      ctx.beginPath();
+      ctx.arc(meCanvas.x, meCanvas.y, 3, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.fillText('Me', meCanvas.x + 5, meCanvas.y - 2);
+
+      // 부채꼴
+      drawFan(playerpos, playerLidarAngleZ);
+    }
+
+    async function fetchDataAndRender() {
+      try {
+        const res = await fetch('/data');
+        const data = await res.json();
+        drawMap(data.obstacles, data.lidar, data.playerPos, data.playerLidarAngleZ);
+      } catch (err) {
+        console.error('데이터 가져오기 실패:', err);
+      }
+    }
+
+    fetchDataAndRender();
+    setInterval(fetchDataAndRender, 1000);
+
+    // map2에 전체 장애물 데이터 수신 및 점 표시 (SocketIO로 수신) 
+
+
+
+    // 맵2 착탄
+    const tank = document.getElementById('tank');
+    const impact = document.getElementById('impact');
+    const realimpact = document.getElementById('realimpact');
+    const mapSize = 300;
+    let hideRealImpactTimeout = null;  // 타이머 핸들 저장용
+
+    function updateTank() {
+      fetch('/tank_status')
+        .then(res => res.json())
+        .then(data => {
+          const x = data.x || 0;
+          const z = data.z || 0;
+          const yaw = data.yaw || 0;
+          const impact_x = data.impact_x;
+          const impact_z = data.impact_z;
+          const real_impact_x = data.real_impact_x;
+          const real_impact_z = data.real_impact_z;
+                  
+          // 탱크 위치
+          const mapX = x;
+          const mapY = mapSize - z;
+          tank.style.left = `${mapX - 6}px`;
+          tank.style.top = `${mapY - 6}px`;
+          tank.style.transform = `rotate(${yaw}deg)`;
+
+          // 착탄 위치
+          if (impact_x !== null && impact_z !== null) {
+            const impactX = impact_x;
+            const impactY = mapSize - impact_z;
+            impact.style.left = `${impactX - 6}px`;
+            impact.style.top = `${impactY - 6}px`;
+            impact.style.display = 'block';
+          } else {
+            impact.style.display = 'none';
+          }
+
+          // 실제 착탄 위치 처리
+          if (real_impact_x !== 0 && real_impact_z !== 0) {
+            const realImpactX = real_impact_x;
+            const realImpactY = mapSize - real_impact_z;
+            realimpact.style.left = `${realImpactX - 12}px`;
+            realimpact.style.top = `${realImpactY - 12}px`;
+            realimpact.style.display = 'block';
+
+            // 이전 타이머 제거 후 새 타이머 설정
+            if (hideRealImpactTimeout) {
+                clearTimeout(hideRealImpactTimeout);
+            }
+            hideRealImpactTimeout = setTimeout(() => {
+                realimpact.style.display = 'none';
+            }, 500);
+          }
+        });
+    }
+
+    setInterval(updateTank, 300);
+
+  </script>
+</body>
+</html>
